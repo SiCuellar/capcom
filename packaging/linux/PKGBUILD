@@ -1,0 +1,31 @@
+# Maintainer: Capcom contributors
+# Sketch only: builds from a local checkout/tag. Not published.
+pkgname=capcom
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Private self-hosted dictation client (Omarchy / Hyprland)'
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('wl-clipboard' 'wtype' 'pipewire' 'pipewire-alsa' 'libnotify' 'jq')
+makedepends=('rust' 'alsa-lib' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz")   # e.g. git archive of the repo
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  install -Dm755 target/release/capcom "$pkgdir/usr/bin/capcom"
+  install -Dm644 packaging/linux/capcom.service "$pkgdir/usr/lib/systemd/user/capcom.service"
+  # sed: the packaged unit lives in /usr/bin, not ~/.local/bin
+  sed -i 's|%h/.local/bin/capcom|/usr/bin/capcom|' "$pkgdir/usr/lib/systemd/user/capcom.service"
+  for f in omarchy-dictation-capcom omarchy-install-dictation-capcom omarchy-remove-dictation-capcom; do
+    install -Dm755 "packaging/linux/omarchy/$f" "$pkgdir/usr/bin/$f"
+  done
+  install -Dm644 packaging/linux/waybar-capcom.jsonc "$pkgdir/usr/share/capcom/waybar-capcom.jsonc"
+  install -Dm644 packaging/linux/hyprland-binds.lua "$pkgdir/usr/share/capcom/hyprland-binds.lua"
+  install -Dm644 packaging/linux/hyprland-binds.conf "$pkgdir/usr/share/capcom/hyprland-binds.conf"
+}

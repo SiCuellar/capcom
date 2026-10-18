@@ -1,0 +1,89 @@
+name: Release
+
+# Push a tag like v0.2.0 -> builds Capcom.app (universal) + Linux binaries -> GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build universal Capcom.app (ad-hoc signed, not notarized)
+        env:
+          CAPCOM_UNIVERSAL: "1"
+        run: packaging/macos/make-app.sh
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          lipo -info packaging/macos/build/Capcom.app/Contents/MacOS/capcom
+          ditto -c -k --keepParent packaging/macos/build/Capcom.app dist/Capcom-macos-universal.zip
+          tar -C target/universal -czf dist/capcom-macos-universal.tar.gz capcom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libasound2-dev
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="capcom-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name/packaging"
+          cp target/release/capcom LICENSE README.md "dist/$name/"
+          cp -R packaging/linux "dist/$name/packaging/linux"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/${name:?}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: [macos, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --title "Capcom $TAG" --generate-notes \
+            --notes "Unsigned build: after unzipping, right-click Capcom.app > Open once (or run: xattr -dr com.apple.quarantine /Applications/Capcom.app). Then run \`capcom setup\`."

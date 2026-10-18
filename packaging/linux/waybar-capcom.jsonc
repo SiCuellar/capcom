@@ -1,0 +1,30 @@
+// Waybar module for Capcom. Add "custom/capcom" to modules-right in ~/.config/waybar/config.jsonc
+// and merge this block into the same file. Style with the CSS below in ~/.config/waybar/style.css.
+//
+// `capcom status --json` prints {"ok":true,"state":"recording",...} (or state "offline" when the
+// daemon is down); jq reshapes it into Waybar's {text,alt,class,tooltip} protocol.
+// The daemon also writes $XDG_RUNTIME_DIR/capcom/state (idle|recording|processing) if you
+// prefer a plain `cat`.
+{
+  "custom/capcom": {
+    "exec": "capcom status --json | jq -c '{alt: .state, class: .state, tooltip: (\"Capcom: \" + .state)}'",
+    "return-type": "json",
+    "interval": 1,
+    "format": "{icon}",
+    "format-icons": {
+      "idle": "󰍬",
+      "recording": "󰍮",
+      "transcribing": "󰔟",
+      "cleaning": "󰔟",
+      "pasting": "󰆒",
+      "offline": "󰍭"
+    },
+    "tooltip": true,
+    "on-click": "capcom toggle"
+  }
+}
+/* style.css
+#custom-capcom.recording { color: #ff5555; }
+#custom-capcom.transcribing, #custom-capcom.cleaning, #custom-capcom.pasting { color: #f1fa8c; }
+#custom-capcom.offline { opacity: 0.4; }
+*/

@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# omarchy:summary=Remove Capcom dictation integration
+# omarchy:requires-sudo=false
+
+set -e
+
+systemctl --user disable --now capcom.service 2>/dev/null || true
+systemctl --user daemon-reload
+
+backend_config="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/defaults/dictation"
+if [[ -f $backend_config && $(<"$backend_config") == "capcom" ]]; then
+  rm "$backend_config"
+fi
+command -v hyprctl &>/dev/null && hyprctl reload >/dev/null 2>&1 || true
+echo "Capcom dictation disabled. Config in ~/.config/capcom and history are kept."

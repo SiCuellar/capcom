@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# omarchy:summary=Install and configure Capcom dictation
+# omarchy:requires-sudo=true
+#
+# Run by `omarchy-default-dictation capcom` (Setup > Defaults > Dictation) in a floating
+# terminal. Mirrors omarchy-install-dictation-voxtype: install deps, configure, enable the
+# user service, select the backend with omarchy-dictation-use, reload Hyprland.
+
+set -e
+
+if ! command -v capcom &>/dev/null; then
+  echo "capcom is not in PATH. Build and install it first: packaging/linux/install.sh" >&2
+  exit 1
+fi
+
+if command -v omarchy-pkg-add &>/dev/null; then
+  omarchy-pkg-add wl-clipboard wtype libnotify pipewire
+fi
+
+capcom config init
+if ! systemctl --user cat capcom.service &>/dev/null; then
+  echo "capcom.service is not installed. Run packaging/linux/install.sh" >&2
+  exit 1
+fi
+systemctl --user daemon-reload
+systemctl --user enable --now capcom.service
+systemctl --user restart capcom.service
+
+omarchy-dictation-use capcom
+hyprctl reload >/dev/null
+omarchy-notification-send -g "" "Capcom dictation ready" "Hold F9 or Right Alt, or press Super+Ctrl+X to toggle" -t 10000
+capcom doctor || true
