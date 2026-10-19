@@ -350,15 +350,51 @@ pub fn set_audio_device_text(text: &str, name: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Replace `path` atomically with `contents` (mode 0600): write a sibling temp file, fsync it,
+/// then rename over the target, so a crash never leaves a truncated config. A symlinked `path`
+/// is resolved first, so the rename replaces the link's target and the link stays.
+fn write_private_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let target = match std::fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(e).with_context(|| format!("resolving {}", path.display())),
+    };
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.toml".into());
+    let tmp = target.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let res = (|| -> Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
 /// Set `[audio] device` in the config file at `path` (created with defaults' layout if absent),
-/// keeping the file private (0600).
+/// atomically, keeping the file private (0600).
 pub fn save_audio_device(path: &Path, name: &str) -> Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default().to_toml()?,
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    write_private(path, &set_audio_device_text(&text, name)?)
+    write_private_atomic(path, &set_audio_device_text(&text, name)?)
 }
 
 /// `capcom config init`: write default config + cleanup prompt. Returns paths written.
@@ -484,6 +520,27 @@ mod tests {
         let c = Config::load_from(&p).unwrap();
         assert_eq!((c.audio.device.as_str(), c.history.keep), ("Studio Mic", 9));
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn save_device_is_atomic_and_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("dotfiles").join("capcom.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "[history]\nkeep = 9\n").unwrap();
+        let link = d.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        save_audio_device(&link, "Studio Mic").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(Config::load_from(&real).unwrap().audio.device, "Studio Mic");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+        // No temp files left behind, and a failed edit leaves the original untouched.
+        let leftovers = |dir: &Path| std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp-")).count();
+        assert_eq!(leftovers(real.parent().unwrap()) + leftovers(d.path()), 0);
+        std::fs::write(&real, "audio = { device = \"a\" }\n").unwrap();
+        assert!(save_audio_device(&link, "b").is_err());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "audio = { device = \"a\" }\n");
     }
 
     #[test]

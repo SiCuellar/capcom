@@ -85,6 +85,8 @@ struct Shared {
     mic_menu: Retained<NSMenu>,
     /// `audio.device` value behind each submenu item, by tag (rebuilt together with the items).
     mic_values: RefCell<Vec<String>>,
+    /// Bumped by every refresh and every pick; a refresh result from an older generation is dropped.
+    mic_gen: Cell<u64>,
     login: Retained<NSMenuItem>,
     _menu: Retained<NSMenu>,
     target: Retained<MenuTarget>,
@@ -291,6 +293,7 @@ impl StatusItem {
             mic,
             mic_menu,
             mic_values: RefCell::new(Vec::new()),
+            mic_gen: Cell::new(0),
             login,
             _menu: menu,
             target,
@@ -424,7 +427,9 @@ impl Shared {
     /// Rebuild the Microphone item from the config file and the current input devices. The
     /// enumeration runs off the main thread; the menu keeps its previous items until it lands.
     fn refresh_mic(&self) {
-        background(|| {
+        let gen = self.mic_gen.get() + 1;
+        self.mic_gen.set(gen);
+        background(move || {
             let configured = Config::load().map(|c| c.audio.device).unwrap_or_else(|e| {
                 tracing::warn!("microphone menu: cannot read config: {e:#}");
                 "default".into()
@@ -434,7 +439,13 @@ impl Shared {
                 Vec::new()
             });
             let model = mic_menu_model(&configured, &devices);
-            on_main(move || with_shared(|s| s.apply_mic(&model)));
+            on_main(move || {
+                with_shared(|s| {
+                    if s.mic_gen.get() == gen {
+                        s.apply_mic(&model);
+                    }
+                })
+            });
         });
     }
 
@@ -466,6 +477,7 @@ impl Shared {
     /// Save the choice to the config, then tell the daemon (it applies it from the next recording).
     fn pick_mic(&self, tag: isize) {
         let Some(value) = usize::try_from(tag).ok().and_then(|i| self.mic_values.borrow().get(i).cloned()) else { return };
+        self.mic_gen.set(self.mic_gen.get() + 1); // refreshes already in flight predate this pick
         background(move || {
             if let Err(e) = config::save_audio_device(&config::config_path(), &value) {
                 crate::platform::macos::notify(&format!("cannot save microphone: {e:#}"));

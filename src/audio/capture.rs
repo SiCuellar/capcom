@@ -529,7 +529,7 @@ impl AudioSource for CpalSource {
 
     fn set_device(&mut self, name: &str) -> Result<()> {
         let name = name.trim();
-        if name == self.cfg.device {
+        if name == self.cfg.device.trim() {
             self.pending_device = None; // already there: keep the open stream (and its pre-roll)
             return Ok(());
         }
