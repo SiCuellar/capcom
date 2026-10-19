@@ -213,27 +213,46 @@ pub struct CpalSource {
     events: Option<UnboundedSender<CaptureEvent>>,
     shared: Option<Arc<Shared>>,
     open: Option<Open>,
+    /// A device switch requested mid-clip; applied when the clip ends.
+    pending_device: Option<String>,
     open_ms: u64,
     stats: CaptureStats,
     /// Level callback; shared with the stream callback so it survives stream reopen.
     level_sink: Arc<Mutex<Option<LevelSink>>>,
 }
 
-fn find_device(host: &cpal::Host, want: &str) -> Result<cpal::Device> {
+/// True for the config values that mean "whatever the system default input is".
+pub fn is_default_choice(want: &str) -> bool {
     let want = want.trim();
-    if want.is_empty() || want.eq_ignore_ascii_case("default") {
+    want.is_empty() || want.eq_ignore_ascii_case("default")
+}
+
+/// Index of the device `want` selects: an exact (case-insensitive) name wins over the first
+/// name that merely contains `want`. `None` for the default choice or when nothing matches.
+pub fn pick_device_name<S: AsRef<str>>(want: &str, names: &[S]) -> Option<usize> {
+    if is_default_choice(want) {
+        return None;
+    }
+    let want = want.trim().to_lowercase();
+    names
+        .iter()
+        .position(|n| n.as_ref().to_lowercase() == want)
+        .or_else(|| names.iter().position(|n| n.as_ref().to_lowercase().contains(&want)))
+}
+
+fn find_device(host: &cpal::Host, want: &str) -> Result<cpal::Device> {
+    if is_default_choice(want) {
         return host.default_input_device().ok_or_else(|| anyhow!("no default input device"));
     }
-    let needle = want.to_lowercase();
-    let mut names = vec![];
+    let mut devices = vec![];
     for d in host.input_devices().context("listing input devices")? {
-        let name = device_name(&d);
-        if name.to_lowercase().contains(&needle) {
-            return Ok(d);
-        }
-        names.push(name);
+        devices.push((device_name(&d), d));
     }
-    bail!("no input device matching {want:?}; available: {}", names.join(", "))
+    let names: Vec<&str> = devices.iter().map(|(n, _)| n.as_str()).collect();
+    match pick_device_name(want, &names) {
+        Some(i) => Ok(devices.swap_remove(i).1),
+        None => bail!("no input device matching {:?}; available: {}", want.trim(), names.join(", ")),
+    }
 }
 
 fn device_name(d: &cpal::Device) -> String {
@@ -269,7 +288,7 @@ impl CpalSource {
     /// `always_on` mode opens the stream immediately (failure is logged and retried on `start`).
     pub fn new(cfg: &AudioConfig, events: Option<UnboundedSender<CaptureEvent>>) -> Result<Self> {
         let mode = MicMode::parse(&cfg.mic_mode)?;
-        let mut s = Self { cfg: cfg.clone(), mode, events, shared: None, open: None, open_ms: 0, stats: CaptureStats::default(), level_sink: Arc::new(Mutex::new(None)) };
+        let mut s = Self { cfg: cfg.clone(), mode, events, shared: None, open: None, pending_device: None, open_ms: 0, stats: CaptureStats::default(), level_sink: Arc::new(Mutex::new(None)) };
         if mode == MicMode::AlwaysOn {
             if let Err(e) = s.ensure_open() {
                 tracing::warn!("always_on: cannot open microphone yet: {e:#}");
@@ -336,8 +355,23 @@ impl CpalSource {
         if self.mode == MicMode::OnDemand {
             self.open = None; // dropping the stream closes the device
         }
-        let mut rec = sh.rec();
-        rec.finish()
+        let raw = sh.rec().finish();
+        if let Some(name) = self.pending_device.take() {
+            self.apply_device(&name);
+        }
+        raw
+    }
+
+    /// Point the source at `name` (a config `audio.device` value). Closes the current stream;
+    /// the next `start` (or, in `always_on` mode, right now) opens the new device.
+    fn apply_device(&mut self, name: &str) {
+        self.cfg.device = name.to_string();
+        self.open = None;
+        if self.mode == MicMode::AlwaysOn {
+            if let Err(e) = self.ensure_open() {
+                tracing::warn!("always_on: cannot open {name:?}: {e:#}");
+            }
+        }
     }
 }
 
@@ -493,6 +527,21 @@ impl AudioSource for CpalSource {
         self.events.is_some()
     }
 
+    fn set_device(&mut self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name == self.cfg.device.trim() {
+            self.pending_device = None; // already there: keep the open stream (and its pre-roll)
+            return Ok(());
+        }
+        if self.shared.as_ref().is_some_and(|s| s.rec().is_recording()) {
+            self.pending_device = Some(name.to_string()); // the running clip keeps its device
+        } else {
+            self.pending_device = None;
+            self.apply_device(name);
+        }
+        Ok(())
+    }
+
     fn set_level_sink(&mut self, sink: Option<LevelSink>) {
         *self.level_sink.lock().unwrap_or_else(|e| e.into_inner()) = sink;
     }
@@ -571,6 +620,18 @@ mod tests {
         let o = rec.push(&ramp(12, 16));
         assert!(!o.capped_now, "cap fires once");
         assert_eq!(rec.finish(), ramp(0, 8));
+    }
+
+    #[test]
+    fn device_pick_prefers_exact_then_substring() {
+        let names = ["MacBook Pro Microphone", "Shure MV7", "Shure MV7+"];
+        assert_eq!(pick_device_name("shure mv7", &names), Some(1));
+        assert_eq!(pick_device_name("MV7+", &names), Some(2));
+        assert_eq!(pick_device_name("macbook", &names), Some(0));
+        assert_eq!(pick_device_name("airpods", &names), None);
+        assert_eq!(pick_device_name("default", &names), None);
+        assert_eq!(pick_device_name("  ", &names), None);
+        assert!(is_default_choice(" Default ") && is_default_choice("") && !is_default_choice("x"));
     }
 
     #[test]

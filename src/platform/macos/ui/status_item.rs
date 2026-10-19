@@ -5,6 +5,7 @@
 
 use super::app::{ipc_blocking, request_quit};
 use super::on_main;
+use crate::audio::capture::{is_default_choice, list_input_devices, pick_device_name, DeviceInfo};
 use crate::config::{self, Config};
 use crate::ipc::{self, Request};
 use crate::ui::{UiComponent, UiEvent, UiState};
@@ -80,9 +81,15 @@ struct Shared {
     toggle: Retained<NSMenuItem>,
     last_error: Retained<NSMenuItem>,
     server: Retained<NSMenuItem>,
+    mic: Retained<NSMenuItem>,
+    mic_menu: Retained<NSMenu>,
+    /// `audio.device` value behind each submenu item, by tag (rebuilt together with the items).
+    mic_values: RefCell<Vec<String>>,
+    /// Bumped by every refresh and every pick; a refresh result from an older generation is dropped.
+    mic_gen: Cell<u64>,
     login: Retained<NSMenuItem>,
     _menu: Retained<NSMenu>,
-    _target: Retained<MenuTarget>,
+    target: Retained<MenuTarget>,
     state: Cell<UiState>,
     cfg: Config,
     bundled: bool,
@@ -177,6 +184,13 @@ define_class!(
             });
         }
 
+        #[unsafe(method(pickMic:))]
+        fn pick_mic(&self, sender: Option<&AnyObject>) {
+            let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) else { return };
+            let tag = item.tag();
+            with_shared(|s| s.pick_mic(tag));
+        }
+
         #[unsafe(method(toggleLogin:))]
         fn toggle_login(&self, _sender: Option<&AnyObject>) {
             with_shared(|s| s.toggle_login());
@@ -196,6 +210,7 @@ define_class!(
             with_shared(|s| {
                 s.refresh_login();
                 s.maybe_check_server();
+                s.refresh_mic();
             });
         }
     }
@@ -253,6 +268,11 @@ impl StatusItem {
         add("Open config file", Some(sel!(openConfig:)));
         add("Open history", Some(sel!(openHistory:)));
         let server = add("Server: checking…", None);
+        let mic = add("Microphone: …", None);
+        let mic_menu = NSMenu::new(mtm);
+        mic_menu.setAutoenablesItems(false);
+        mic.setSubmenu(Some(&mic_menu));
+        mic.setEnabled(true); // `add` disables action-less items; a submenu parent must stay enabled
         sep();
         let login = add("Launch at login", Some(sel!(toggleLogin:)));
         if !bundled {
@@ -270,9 +290,13 @@ impl StatusItem {
             toggle,
             last_error,
             server,
+            mic,
+            mic_menu,
+            mic_values: RefCell::new(Vec::new()),
+            mic_gen: Cell::new(0),
             login,
             _menu: menu,
-            _target: target,
+            target,
             state: Cell::new(UiState::Idle),
             cfg: cfg.clone(),
             bundled,
@@ -282,6 +306,7 @@ impl StatusItem {
         shared.render(UiState::Idle, None);
         shared.refresh_login();
         shared.maybe_check_server();
+        shared.refresh_mic();
         Self { shared }
     }
 }
@@ -399,6 +424,75 @@ impl Shared {
         self.refresh_login();
     }
 
+    /// Rebuild the Microphone item from the config file and the current input devices. The
+    /// enumeration runs off the main thread; the menu keeps its previous items until it lands.
+    fn refresh_mic(&self) {
+        let gen = self.mic_gen.get() + 1;
+        self.mic_gen.set(gen);
+        background(move || {
+            let configured = Config::load().map(|c| c.audio.device).unwrap_or_else(|e| {
+                tracing::warn!("microphone menu: cannot read config: {e:#}");
+                "default".into()
+            });
+            let devices = list_input_devices().unwrap_or_else(|e| {
+                tracing::warn!("microphone menu: cannot list input devices: {e:#}");
+                Vec::new()
+            });
+            let model = mic_menu_model(&configured, &devices);
+            on_main(move || {
+                with_shared(|s| {
+                    if s.mic_gen.get() == gen {
+                        s.apply_mic(&model);
+                    }
+                })
+            });
+        });
+    }
+
+    fn apply_mic(&self, model: &MicMenuModel) {
+        self.mic.setTitle(&NSString::from_str(&model.title));
+        self.mic_menu.removeAllItems();
+        let mut values = self.mic_values.borrow_mut();
+        values.clear();
+        for (i, c) in model.choices.iter().enumerate() {
+            // SAFETY: valid title/selector; key equivalent empty.
+            let it = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(self.mtm),
+                    &NSString::from_str(&c.title),
+                    Some(sel!(pickMic:)),
+                    ns_string!(""),
+                )
+            };
+            // SAFETY: the target is retained by `Shared` for the life of the menu.
+            unsafe { it.setTarget(Some(&self.target)) };
+            it.setTag(i as isize);
+            it.setEnabled(c.available);
+            it.setState(if c.checked { NSControlStateValueOn } else { NSControlStateValueOff });
+            self.mic_menu.addItem(&it);
+            values.push(c.value.clone());
+        }
+    }
+
+    /// Save the choice to the config, then tell the daemon (it applies it from the next recording).
+    fn pick_mic(&self, tag: isize) {
+        let Some(value) = usize::try_from(tag).ok().and_then(|i| self.mic_values.borrow().get(i).cloned()) else { return };
+        self.mic_gen.set(self.mic_gen.get() + 1); // refreshes already in flight predate this pick
+        background(move || {
+            if let Err(e) = config::save_audio_device(&config::config_path(), &value) {
+                crate::platform::macos::notify(&format!("cannot save microphone: {e:#}"));
+                return;
+            }
+            let r = ipc_blocking(&ipc::socket_path(), &Request::SetDevice { name: value }, Duration::from_secs(5));
+            match r {
+                Ok(r) if !r.ok => crate::platform::macos::notify(r.error.as_deref().unwrap_or("cannot switch microphone")),
+                Err(e) => crate::platform::macos::notify(&format!("daemon unreachable: {e}")),
+                Ok(_) => {}
+            }
+            on_main(|| with_shared(|s| s.refresh_mic()));
+        });
+    }
+
     fn maybe_check_server(&self) {
         if self.last_server_check.get().is_some_and(|t| t.elapsed() < SERVER_CHECK_EVERY) {
             return;
@@ -415,6 +509,60 @@ impl Shared {
             on_main(move || with_shared(|s| s.server.setTitle(&NSString::from_str(&line))));
         });
     }
+}
+
+/// One entry of the Microphone submenu.
+#[derive(Debug, PartialEq)]
+struct MicChoice {
+    title: String,
+    /// What gets written to `[audio] device`.
+    value: String,
+    checked: bool,
+    /// False for a configured device that is not plugged in.
+    available: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct MicMenuModel {
+    /// The menu line, e.g. `Microphone: MacBook Pro Microphone`.
+    title: String,
+    choices: Vec<MicChoice>,
+}
+
+/// Labels and checkmarks for the Microphone submenu: "System default (<name>)" first, then every
+/// input device. The device `configured` resolves to is checked (same matching as recording);
+/// a configured device that is gone is listed, checked and unavailable.
+fn mic_menu_model(configured: &str, devices: &[DeviceInfo]) -> MicMenuModel {
+    let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+    let default_name = devices.iter().find(|d| d.is_default).map(|d| d.name.as_str());
+    let is_default = is_default_choice(configured);
+    let matched = pick_device_name(configured, &names);
+    let missing = !is_default && matched.is_none();
+
+    let mut choices = vec![MicChoice {
+        title: format!("System default ({})", default_name.unwrap_or("no input device")),
+        value: "default".into(),
+        checked: is_default,
+        available: true,
+    }];
+    if missing {
+        choices.push(MicChoice {
+            title: format!("{} (not connected)", configured.trim()),
+            value: configured.trim().into(),
+            checked: true,
+            available: false,
+        });
+    }
+    for (i, d) in devices.iter().enumerate() {
+        choices.push(MicChoice { title: d.name.clone(), value: d.name.clone(), checked: matched == Some(i), available: true });
+    }
+    let title = if missing {
+        format!("Microphone: {} (not connected)", configured.trim())
+    } else {
+        let name = matched.map(|i| names[i]).or(default_name).unwrap_or("no input device");
+        format!("Microphone: {name}")
+    };
+    MicMenuModel { title: truncate(&title, 60), choices }
 }
 
 /// Run blocking work off the main thread.
@@ -580,6 +728,56 @@ mod tests {
         assert_eq!(server_line(Ok(12), Ok(30)), "Server: OK (ASR 12 ms · LLM 30 ms)");
         assert_eq!(server_line(Err("unreachable".into()), Err("unreachable".into())), "Server: unreachable");
         assert_eq!(server_line(Ok(1), Err("key rejected".into())), "Server: ASR OK · LLM key rejected");
+    }
+
+    fn dev(name: &str, is_default: bool) -> DeviceInfo {
+        DeviceInfo { name: name.into(), is_default, rate: 48000, channels: 1, format: "f32".into() }
+    }
+
+    fn checked(m: &MicMenuModel) -> Vec<&str> {
+        m.choices.iter().filter(|c| c.checked).map(|c| c.title.as_str()).collect()
+    }
+
+    #[test]
+    fn mic_menu_default_is_checked() {
+        let devs = [dev("MacBook Pro Microphone", true), dev("AirPods", false)];
+        let m = mic_menu_model("default", &devs);
+        assert_eq!(m.title, "Microphone: MacBook Pro Microphone");
+        assert_eq!(m.choices[0].title, "System default (MacBook Pro Microphone)");
+        assert_eq!(m.choices[0].value, "default");
+        assert_eq!(checked(&m), ["System default (MacBook Pro Microphone)"]);
+        assert_eq!(m.choices.len(), 3);
+        assert_eq!(mic_menu_model("", &devs), m);
+    }
+
+    #[test]
+    fn mic_menu_checks_the_named_device() {
+        let devs = [dev("MacBook Pro Microphone", true), dev("Shure MV7", false), dev("Shure MV7+", false)];
+        let m = mic_menu_model("shure mv7", &devs);
+        assert_eq!(m.title, "Microphone: Shure MV7");
+        assert_eq!(checked(&m), ["Shure MV7"]);
+        let pick = m.choices.iter().find(|c| c.checked).unwrap();
+        assert_eq!((pick.value.as_str(), pick.available), ("Shure MV7", true));
+        // A substring config value resolves like recording does, and writes the full name back.
+        assert_eq!(checked(&mic_menu_model("macbook", &devs)), ["MacBook Pro Microphone"]);
+    }
+
+    #[test]
+    fn mic_menu_missing_device_is_checked_but_unavailable() {
+        let devs = [dev("MacBook Pro Microphone", true)];
+        let m = mic_menu_model("Shure MV7", &devs);
+        assert_eq!(m.title, "Microphone: Shure MV7 (not connected)");
+        assert_eq!(checked(&m), ["Shure MV7 (not connected)"]);
+        let gone = m.choices.iter().find(|c| c.checked).unwrap();
+        assert!(!gone.available);
+        assert!(m.choices.iter().filter(|c| c.available).count() == 2);
+    }
+
+    #[test]
+    fn mic_menu_without_inputs() {
+        let m = mic_menu_model("default", &[]);
+        assert_eq!(m.title, "Microphone: no input device");
+        assert_eq!(m.choices[0].title, "System default (no input device)");
     }
 
     #[test]
