@@ -118,6 +118,14 @@ impl Daemon {
                 Ok(v) => Response::ok_data(self.state(), json!(v)),
                 Err(e) => Response::err(e.to_string()),
             },
+            Request::SetDevice { name } => {
+                let mut g = self.inner.lock().unwrap();
+                match g.audio.as_mut().map(|a| a.set_device(&name)) {
+                    Some(Ok(())) => Response::ok(g.state),
+                    Some(Err(e)) => Response::err(e.to_string()),
+                    None => Response::err("no audio source on this platform yet"),
+                }
+            }
             Request::DebugTranscribe { path } => self.cmd_debug_transcribe(path).await,
         }
     }
@@ -504,5 +512,42 @@ mod tests {
         d.fb(FeedbackEvent::RecordingStarted); // a new dictation starts before the error settles
         tokio::time::sleep(SETTLE_ERROR * 2).await;
         assert_eq!(*rec.0.lock().unwrap(), vec![UiEvent::Error("boom".into()), UiEvent::State(UiState::Listening)]);
+    }
+
+    struct FakeAudio(Arc<Mutex<Vec<String>>>);
+    impl AudioSource for FakeAudio {
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<Vec<i16>> {
+            Ok(vec![])
+        }
+        fn cancel(&mut self) {}
+        fn set_device(&mut self, name: &str) -> Result<()> {
+            self.0.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+    }
+
+    fn test_daemon(audio: Option<Box<dyn AudioSource>>) -> Arc<Daemon> {
+        let platform = Platform { paster: Box::new(crate::platform::LogPaster), feedback: Box::new(crate::platform::LogFeedback), hotkey: None };
+        let http = crate::asr::http_client();
+        let clients = Clients {
+            asr: crate::asr::AsrClient::new(http.clone(), "http://127.0.0.1:9/v1/audio/transcriptions", "m", "k"),
+            cleanup: crate::cleanup::CleanupClient::new(http, "http://127.0.0.1:9/v1/chat/completions", "m", "k", String::new()),
+        };
+        Arc::new(Daemon::new(Config::default(), clients, platform, audio))
+    }
+
+    #[tokio::test]
+    async fn set_device_reaches_the_audio_source() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let d = test_daemon(Some(Box::new(FakeAudio(seen.clone()))));
+        let r = d.handle(Request::SetDevice { name: "Shure MV7".into() }).await;
+        assert!(r.ok, "{r:?}");
+        assert_eq!(*seen.lock().unwrap(), vec!["Shure MV7"]);
+
+        let r = test_daemon(None).handle(Request::SetDevice { name: "x".into() }).await;
+        assert!(!r.ok && r.error.unwrap().contains("no audio source"));
     }
 }

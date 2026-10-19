@@ -45,7 +45,8 @@ pub struct CleanupConfig {
 pub struct AudioConfig {
     /// `on_demand` or `always_on` (pre-roll).
     pub mic_mode: String,
-    /// `default` or a case-insensitive substring of an input device name (`capcom devices`).
+    /// `default`, or an input device name (`capcom devices`): an exact name (any case) wins, else
+    /// the first name containing it.
     pub device: String,
     pub min_clip_ms: u64,
     /// Pre-roll kept while the mic is open in `always_on` mode.
@@ -276,6 +277,90 @@ pub fn write_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Return `text` with `[audio] device` set to `name`, touching nothing else (comments, key
+/// order and `vocabulary` survive). Edits the existing `device` line, else adds one under
+/// `[audio]`, else appends an `[audio]` table. The result is re-parsed and compared with the
+/// original, so an unusual layout (dotted keys, inline tables) is an error, never a corrupt file.
+pub fn set_audio_device_text(text: &str, name: &str) -> Result<String> {
+    let name = name.trim();
+    let value = toml::Value::String(name.to_string()).to_string();
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let mut in_audio = false;
+    let mut in_multiline = false;
+    let mut header_at = None;
+    let mut device_at = None;
+    for (i, line) in lines.iter().enumerate() {
+        let was_multiline = in_multiline;
+        // An odd number of triple quotes opens or closes a multi-line string.
+        if (line.matches("\"\"\"").count() + line.matches("'''").count()) % 2 == 1 {
+            in_multiline = !in_multiline;
+        }
+        if was_multiline {
+            continue;
+        }
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            let table = t.trim_start_matches('[').split(']').next().unwrap_or("").trim();
+            in_audio = t.starts_with("[audio]") || (!t.starts_with("[[") && table == "audio");
+            if in_audio && header_at.is_none() {
+                header_at = Some(i);
+            }
+        } else if in_audio && device_at.is_none() {
+            if let Some(rest) = t.strip_prefix("device") {
+                if rest.trim_start().starts_with('=') {
+                    device_at = Some(i);
+                }
+            }
+        }
+    }
+    if let Some(i) = device_at {
+        let line = &lines[i];
+        let indent = &line[..line.len() - line.trim_start().len()];
+        let after_eq = line.split_once('=').map(|x| x.1).unwrap_or("").trim_start();
+        // Keep a trailing `# comment` when the old value is a plain one-line string.
+        let tail = match after_eq.chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let mut esc = false;
+                let end = after_eq[1..].char_indices().find(|&(_, c)| {
+                    let hit = c == q && !(esc && q == '"');
+                    esc = c == '\\' && !esc;
+                    hit
+                });
+                end.map(|(j, _)| after_eq[j + 2..].to_string()).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        lines[i] = format!("{indent}device = {value}{tail}");
+    } else if let Some(i) = header_at {
+        lines.insert(i + 1, format!("device = {value}"));
+    } else {
+        if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push("[audio]".into());
+        lines.push(format!("device = {value}"));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+
+    let mut expected = Config::from_toml(text)?;
+    expected.audio.device = name.to_string();
+    let got = Config::from_toml(&out).context("edited config no longer parses")?;
+    anyhow::ensure!(got == expected, "cannot edit [audio] device in place; set it by hand in the config file");
+    Ok(out)
+}
+
+/// Set `[audio] device` in the config file at `path` (created with defaults' layout if absent),
+/// keeping the file private (0600).
+pub fn save_audio_device(path: &Path, name: &str) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default().to_toml()?,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    write_private(path, &set_audio_device_text(&text, name)?)
+}
+
 /// `capcom config init`: write default config + cleanup prompt. Returns paths written.
 pub fn init(force: bool) -> Result<Vec<PathBuf>> {
     let mut written = vec![];
@@ -358,6 +443,47 @@ mod tests {
         if std::env::var_os("CAPCOM_API_KEY").is_none() {
             assert_eq!(c.api_key().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn set_device_edits_the_line_and_keeps_the_rest() {
+        let src = "# my config\n[cleanup]\nvocabulary = [\n  \"Acme\",\n  \"[audio]\",\n]\n\n[audio]\nmic_mode = \"always_on\"\ndevice = \"default\"  # which mic\nmin_clip_ms = 700\n\n[history]\nkeep = 3\n";
+        let out = set_audio_device_text(src, "Shure MV7").unwrap();
+        assert_eq!(out, src.replace("device = \"default\"", "device = \"Shure MV7\""));
+        let c = Config::from_toml(&out).unwrap();
+        assert_eq!((c.audio.device.as_str(), c.audio.min_clip_ms, c.history.keep), ("Shure MV7", 700, 3));
+        assert_eq!(c.cleanup.vocabulary, vec!["Acme", "[audio]"]);
+        assert_eq!(set_audio_device_text(&out, "default").unwrap(), src);
+    }
+
+    #[test]
+    fn set_device_adds_missing_key_or_table() {
+        let out = set_audio_device_text("[audio]\nmic_mode = \"on_demand\"\n[history]\nkeep = 2\n", "AirPods").unwrap();
+        assert_eq!(out, "[audio]\ndevice = \"AirPods\"\nmic_mode = \"on_demand\"\n[history]\nkeep = 2\n");
+        let out = set_audio_device_text("[history]\nkeep = 2\n", "AirPods").unwrap();
+        assert_eq!(out, "[history]\nkeep = 2\n\n[audio]\ndevice = \"AirPods\"\n");
+        assert_eq!(Config::from_toml(&set_audio_device_text("", "x").unwrap()).unwrap().audio.device, "x");
+    }
+
+    #[test]
+    fn set_device_quotes_awkward_names_and_rejects_odd_layouts() {
+        let name = "Mic \"A\" \\ B";
+        let out = set_audio_device_text("[audio]\ndevice = 'old' # c\n", name).unwrap();
+        assert_eq!(Config::from_toml(&out).unwrap().audio.device, name);
+        assert!(out.ends_with(" # c\n"));
+        assert!(set_audio_device_text("audio = { device = \"a\" }\n", "b").is_err());
+    }
+
+    #[test]
+    fn save_device_keeps_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "[history]\nkeep = 9\n").unwrap();
+        save_audio_device(&p, "Studio Mic").unwrap();
+        let c = Config::load_from(&p).unwrap();
+        assert_eq!((c.audio.device.as_str(), c.history.keep), ("Studio Mic", 9));
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

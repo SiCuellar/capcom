@@ -24,6 +24,8 @@ pub enum Request {
         #[serde(default = "default_n")]
         n: usize,
     },
+    /// Use `name` (`"default"` or an input device name) from the next recording on.
+    SetDevice { name: String },
     /// Debug: run a WAV file through the daemon's state machine and pipeline
     /// (stands in for a recording until an `AudioSource` exists).
     DebugTranscribe { path: String },
@@ -146,6 +148,11 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"history","n":3}"#).unwrap(),
             Request::History { n: 3 }
         );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"cmd":"set_device","name":"Shure MV7"}"#).unwrap(),
+            Request::SetDevice { name: "Shure MV7".into() }
+        );
+        assert!(serde_json::from_str::<Request>(r#"{"cmd":"set_device"}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"cmd":"nope"}"#).is_err());
     }
 

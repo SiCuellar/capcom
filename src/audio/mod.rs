@@ -38,6 +38,11 @@ pub trait AudioSource: Send {
     fn emits_live_event(&self) -> bool {
         false
     }
+    /// Switch to the input device named by a config `audio.device` value (`"default"` or a
+    /// name). Takes effect from the next clip; a clip in progress keeps its device.
+    fn set_device(&mut self, _name: &str) -> Result<()> {
+        anyhow::bail!("this audio source cannot switch devices")
+    }
     /// Install (or clear) a callback receiving the live input level (0..=1, perceptual, smoothed)
     /// at ~30 Hz while a clip is recording. Called on the audio thread: must not block.
     /// Intended wiring: `Arc::new(move |l| ui.send(UiEvent::Level(l)))`. See [`level`].
