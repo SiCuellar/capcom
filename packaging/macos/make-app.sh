@@ -37,12 +37,12 @@ cp "$HERE/icon/Capcom.icns" "$APP/Contents/Resources/Capcom.icns"
 # Accessibility / Input Monitoring / Microphone grants survive updates. Ad-hoc signatures change
 # every build and macOS then silently drops the grants.
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
-  codesign --force --options runtime --identifier dev.capcom.client --sign "$IDENTITY" "$APP"
+  codesign --force --options runtime --entitlements "$HERE/Capcom.entitlements" --identifier dev.capcom.client --sign "$IDENTITY" "$APP"
   echo "signed with '$IDENTITY'"
 else
   echo "note: signing identity '$IDENTITY' not found (create one with ./create-signing-cert.sh)." >&2
   echo "      Using ad-hoc signing: macOS may ask for permissions again after each rebuild/update." >&2
-  codesign --force --identifier dev.capcom.client --sign - "$APP"
+  codesign --force --options runtime --entitlements "$HERE/Capcom.entitlements" --identifier dev.capcom.client --sign - "$APP"
 fi
 codesign --verify --verbose=2 "$APP"
 echo "built $APP"

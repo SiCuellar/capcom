@@ -1,6 +1,6 @@
 [package]
 name = "capcom"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Private, self-hosted dictation client (Capcom)"
 license = "MIT"
@@ -36,7 +36,7 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
 objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventTypes", "CGEventSource", "CGRemoteOperation"] }
-objc2-av-foundation = { version = "0.3", features = ["AVCaptureDevice", "AVMediaFormat"] }
+objc2-av-foundation = { version = "0.3", features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
 # Menu-bar app host: marshal UiEvents to the main queue; "Launch at login" via SMAppService.
 dispatch2 = "0.3"
 objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService"] }

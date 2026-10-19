@@ -117,6 +117,7 @@ pub fn run_daemon_app(cfg: Config, bundled: bool) -> ! {
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    crate::platform::macos::doctor::request_mic_access();
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 

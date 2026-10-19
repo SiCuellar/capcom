@@ -25,6 +25,22 @@ fn mic_status() -> &'static str {
     }
 }
 
+/// Ask for microphone access up front if macOS has never been asked, so the system prompt
+/// appears at launch instead of the first dictation silently recording zeros (CoreAudio gives an
+/// unauthorized app silence, not an error). Non-blocking; the answer is just logged.
+pub fn request_mic_access() {
+    let Some(media) = (unsafe { AVMediaTypeAudio }) else { return };
+    let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media) };
+    if status == AVAuthorizationStatus::NotDetermined {
+        let handler = block2::RcBlock::new(|granted: objc2::runtime::Bool| {
+            tracing::info!("microphone access {}", if granted.as_bool() { "granted" } else { "denied" });
+        });
+        unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(media, &handler) };
+    } else if status != AVAuthorizationStatus::Authorized {
+        tracing::warn!("microphone access is {}: dictation will record silence; enable Capcom in {URL_MICROPHONE}", mic_status());
+    }
+}
+
 /// Print the macOS checks. Returns true if nothing required is missing.
 /// Note: permissions are per executable identity; run this from the Capcom.app bundle binary
 /// (`/Applications/Capcom.app/Contents/MacOS/capcom doctor`) to test what the daemon will have.
